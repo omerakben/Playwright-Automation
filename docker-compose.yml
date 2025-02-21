@@ -1,0 +1,122 @@
+version: '3.8'
+
+services:
+  # Test Framework
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=test
+      - DATABASE_URL=postgresql://test_user:test_password@db:5432/test_db
+      - MSSQL_SERVER=mssql
+      - MSSQL_DATABASE=test_db
+      - MSSQL_USER=sa
+      - MSSQL_PASSWORD=YourStrong@Password
+      - API_BASE_URL=http://api:3000
+      - ZAP_API_URL=http://zap:8080
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      - db
+      - mssql
+      - api
+      - zap
+
+  # PostgreSQL Database
+  db:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U test_user -d test_db']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MSSQL Database
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=YourStrong@Password
+      - MSSQL_PID=Developer
+    ports:
+      - '1433:1433'
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "YourStrong@Password" -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mock API (for testing)
+  api:
+    image: node:20-slim
+    working_dir: /app
+    command: npm run start:mock-api
+    environment:
+      - PORT=3000
+      - DB_URL=postgresql://test_user:test_password@db:5432/test_db
+      - MSSQL_CONNECTION_STRING=mssql://sa:YourStrong@Password@mssql:1433/test_db
+    volumes:
+      - .:/app
+    ports:
+      - '3000:3000'
+    depends_on:
+      - db
+      - mssql
+
+  # Security Testing
+  zap:
+    image: owasp/zap2docker-stable:latest
+    command: zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.key=12345
+    ports:
+      - '8080:8080'
+
+  # Performance Testing
+  k6:
+    image: grafana/k6:latest
+    volumes:
+      - ./tests/performance:/scripts
+    environment:
+      - K6_OUT=influxdb=http://influxdb:8086/k6
+    depends_on:
+      - influxdb
+
+  # Metrics Storage
+  influxdb:
+    image: influxdb:1.8
+    ports:
+      - '8086:8086'
+    environment:
+      - INFLUXDB_DB=k6
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+
+  # Metrics Visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - '3001:3000'
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - influxdb
+
+volumes:
+  postgres_data:
+  mssql_data:
+  influxdb_data:
+  grafana_data:

@@ -1,0 +1,195 @@
+trigger:
+  - main
+  - develop
+
+variables:
+  NODE_VERSION: '20.x'
+  PLAYWRIGHT_VERSION: '1.50.1'
+  ALLURE_VERSION: '2.24.1'
+  K6_VERSION: '0.47.0'
+  ZAP_VERSION: '2.14.0'
+
+stages:
+  - stage: Setup
+    jobs:
+      - job: Setup
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci
+              npx playwright install --with-deps
+            displayName: 'Install dependencies'
+
+          - script: |
+              curl -L https://github.com/allure-framework/allure2/releases/download/$(ALLURE_VERSION)/allure-$(ALLURE_VERSION).tgz -o allure.tgz
+              tar -zxvf allure.tgz
+              sudo mv allure-$(ALLURE_VERSION) /opt/allure
+              sudo ln -s /opt/allure/bin/allure /usr/local/bin/allure
+            displayName: 'Install Allure'
+
+          - script: |
+              curl -L https://github.com/grafana/k6/releases/download/v$(K6_VERSION)/k6-v$(K6_VERSION)-linux-amd64.tar.gz -o k6.tar.gz
+              tar -zxvf k6.tar.gz
+              sudo mv k6-v$(K6_VERSION)-linux-amd64/k6 /usr/local/bin/k6
+            displayName: 'Install k6'
+
+          - script: |
+              docker pull owasp/zap2docker-stable:$(ZAP_VERSION)
+            displayName: 'Pull ZAP Docker image'
+
+  - stage: Lint
+    dependsOn: Setup
+    jobs:
+      - job: Lint
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              npm ci
+              npm run lint
+            displayName: 'Run linting'
+
+  - stage: Test
+    dependsOn: Lint
+    jobs:
+      - job: E2E_Tests
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              npm ci
+              npx playwright install --with-deps
+              npm run test
+            displayName: 'Run E2E tests'
+            env:
+              CI: 'true'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'test-results/junit.xml'
+              mergeTestResults: true
+              testRunTitle: 'E2E Tests'
+            condition: succeededOrFailed()
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'test-results'
+              artifact: 'test-results'
+              publishLocation: 'pipeline'
+            condition: succeededOrFailed()
+
+      - job: API_Tests
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              npm ci
+              npm run test:api
+            displayName: 'Run API tests'
+
+      - job: Performance_Tests
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              npm ci
+              k6 run tests/performance/**/*.js
+            displayName: 'Run performance tests'
+
+      - job: Security_Tests
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              docker run -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable:$(ZAP_VERSION) zap-baseline.py -t $TARGET_URL -g gen.conf -r security-report.html
+            displayName: 'Run security tests'
+            env:
+              TARGET_URL: $(TARGET_URL)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'security-report.html'
+              artifact: 'security-report'
+              publishLocation: 'pipeline'
+
+      - job: Accessibility_Tests
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - script: |
+              npm ci
+              npm run test:accessibility
+            displayName: 'Run accessibility tests'
+
+  - stage: Report
+    dependsOn: Test
+    jobs:
+      - job: Generate_Reports
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'test-results'
+              targetPath: '$(Pipeline.Workspace)/test-results'
+
+          - script: |
+              allure generate $(Pipeline.Workspace)/test-results/allure-results -o $(Pipeline.Workspace)/allure-report --clean
+            displayName: 'Generate Allure report'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Pipeline.Workspace)/allure-report'
+              artifact: 'allure-report'
+              publishLocation: 'pipeline'
+
+  - stage: Deploy
+    dependsOn: Report
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Deploy_Reports
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(AZURE_SUBSCRIPTION)'
+                    appName: '$(APP_NAME)'
+                    package: '$(Pipeline.Workspace)/allure-report'
+                    deploymentMethod: 'auto'

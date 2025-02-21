@@ -1,0 +1,183 @@
+name: Test Automation
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  NODE_VERSION: '20.x'
+  PLAYWRIGHT_VERSION: '1.50.1'
+  ALLURE_VERSION: '2.24.1'
+  K6_VERSION: '0.47.0'
+  ZAP_VERSION: '2.14.0'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Install Allure
+        run: |
+          curl -L https://github.com/allure-framework/allure2/releases/download/${{ env.ALLURE_VERSION }}/allure-${{ env.ALLURE_VERSION }}.tgz -o allure.tgz
+          tar -zxvf allure.tgz
+          sudo mv allure-${{ env.ALLURE_VERSION }} /opt/allure
+          sudo ln -s /opt/allure/bin/allure /usr/local/bin/allure
+
+      - name: Install k6
+        run: |
+          curl -L https://github.com/grafana/k6/releases/download/v${{ env.K6_VERSION }}/k6-v${{ env.K6_VERSION }}-linux-amd64.tar.gz -o k6.tar.gz
+          tar -zxvf k6.tar.gz
+          sudo mv k6-v${{ env.K6_VERSION }}-linux-amd64/k6 /usr/local/bin/k6
+
+      - name: Pull ZAP Docker image
+        run: docker pull owasp/zap2docker-stable:${{ env.ZAP_VERSION }}
+
+  lint:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: [e2e, api, performance, security, accessibility]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          if [ "${{ matrix.test-type }}" = "e2e" ]; then
+            npx playwright install --with-deps
+          fi
+
+      - name: Run ${{ matrix.test-type }} tests
+        run: |
+          case ${{ matrix.test-type }} in
+            "e2e")
+              npm run test
+              ;;
+            "api")
+              npm run test:api
+              ;;
+            "performance")
+              k6 run tests/performance/**/*.js
+              ;;
+            "security")
+              docker run -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable:${{ env.ZAP_VERSION }} zap-baseline.py -t ${{ secrets.TARGET_URL }} -g gen.conf -r security-report.html
+              ;;
+            "accessibility")
+              npm run test:accessibility
+              ;;
+          esac
+        env:
+          CI: true
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.test-type }}
+          path: |
+            test-results/
+            allure-results/
+            security-report.html
+          retention-days: 30
+
+  report:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-results-*
+          path: test-results
+          merge-multiple: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Generate Allure report
+        run: |
+          allure generate test-results/allure-results -o allure-report --clean
+
+      - name: Upload Allure report
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+          retention-days: 30
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./allure-report
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/test-automation:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/test-automation:${{ github.sha }}
