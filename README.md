@@ -1,4 +1,4 @@
-# Enterprise-Level Playwright Automation Framework
+# Playwright Automation Framework Template
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Playwright](https://img.shields.io/badge/playwright-1.50.1-green)
